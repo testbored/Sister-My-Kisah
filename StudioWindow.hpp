@@ -5,6 +5,7 @@
 #include <X11/Xlib.h>
 
 #include <string>
+#include <vector>
 
 // Native X11 user interface. It owns only presentation and user interaction;
 // all ELF parsing and reconstruction remain in ElfAnalyzer.
@@ -21,11 +22,15 @@ private:
     void draw();
     void drawFunctionList(int height);
     void drawSelectedFunction(int width, int height);
-    void drawCallGraph(const Function& function, int width, int height);
+    void drawCallGraph(int width, int height);
+    void drawGraphNode(const CallGraphNode& node, int x, int y, bool selected);
+    std::vector<CallGraphNode> buildGraphLayout() const;
+    void drawArrow(int fromX, int fromY, int toX, int toY, unsigned long color);
     void handleKey(const XKeyEvent& event);
     void handleClick(const XButtonEvent& event);
     void selectFunctionFromList(int mouseY);
-    void selectCallGraphTarget(int mouseX);
+    void selectGraphNode(int mouseX, int mouseY);
+    void handleMotion(const XMotionEvent& event);
 
     void drawText(int x, int y, const std::string& value, unsigned long color = 0x202538);
     void drawBox(int x, int y, int width, int height, unsigned long color);
@@ -44,7 +49,14 @@ private:
     std::string status_ = "Masukkan path ELF, lalu tekan Analyze.";
     int selectedFunction_ = -1;
     int graphZoom_ = 1;
+    int graphPanX_ = 0;
+    int graphPanY_ = 0;
+    int graphCanvasWidth_ = 1280;
+    bool draggingGraph_ = false;
+    int lastPointerX_ = 0;
+    int lastPointerY_ = 0;
     bool editingPath_ = true;
+    bool graphView_ = false;
 
     static constexpr int kSidebarWidth = 310;
     static constexpr int kHeaderHeight = 92;

@@ -6,7 +6,10 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <map>
+#include <set>
 #include <sstream>
+#include <unordered_map>
 
 namespace {
 
@@ -35,6 +38,68 @@ std::string runCommand(const std::string& command) {
 
 bool startsWith(const std::string& text, const std::string& prefix) {
     return text.rfind(prefix, 0) == 0;
+}
+
+std::vector<std::string> operands(const std::string& instruction) {
+    const auto separator = instruction.find_first_of(" \t");
+    if (separator == std::string::npos) return {};
+    const std::string values = trim(instruction.substr(separator));
+    const auto comma = values.find(',');
+    if (comma == std::string::npos) return {values};
+    return {trim(values.substr(0, comma)), trim(values.substr(comma + 1))};
+}
+
+std::string canonicalRegister(std::string value) {
+    static const std::map<std::string, std::string> aliases = {
+        {"eax", "rax"}, {"ax", "rax"}, {"al", "rax"}, {"ebx", "rbx"}, {"bx", "rbx"},
+        {"ecx", "rcx"}, {"cx", "rcx"}, {"edx", "rdx"}, {"dx", "rdx"}, {"edi", "rdi"},
+        {"esi", "rsi"}, {"ebp", "rbp"}, {"esp", "rsp"}, {"r8d", "r8"}, {"r9d", "r9"},
+    };
+    const auto found = aliases.find(value);
+    return found == aliases.end() ? value : found->second;
+}
+
+std::string stackVariable(const std::string& operand) {
+    const auto base = operand.find("[rbp");
+    if (base == std::string::npos) return "";
+    std::string suffix = operand.substr(base + 4);
+    suffix.erase(std::remove_if(suffix.begin(), suffix.end(), [](char c) { return c == ']' || c == ' '; }), suffix.end());
+    if (suffix.empty()) return "saved_rbp";
+    std::replace(suffix.begin(), suffix.end(), '-', '_');
+    std::replace(suffix.begin(), suffix.end(), '+', '_');
+    return "local" + suffix;
+}
+
+std::string conditionFor(const std::string& mnemonic, const std::string& left, const std::string& right) {
+    const std::string lhs = left.empty() ? "condition" : left;
+    const std::string rhs = right.empty() ? "0" : right;
+    if (mnemonic == "je" || mnemonic == "jz") return lhs + " == " + rhs;
+    if (mnemonic == "jne" || mnemonic == "jnz") return lhs + " != " + rhs;
+    if (mnemonic == "jg" || mnemonic == "ja") return lhs + " > " + rhs;
+    if (mnemonic == "jge" || mnemonic == "jae") return lhs + " >= " + rhs;
+    if (mnemonic == "jl" || mnemonic == "jb") return lhs + " < " + rhs;
+    if (mnemonic == "jle" || mnemonic == "jbe") return lhs + " <= " + rhs;
+    return "condition";
+}
+
+std::string invertedConditionFor(const std::string& mnemonic, const std::string& left, const std::string& right) {
+    const std::string lhs = left.empty() ? "condition" : left;
+    const std::string rhs = right.empty() ? "0" : right;
+    if (mnemonic == "je" || mnemonic == "jz") return lhs + " != " + rhs;
+    if (mnemonic == "jne" || mnemonic == "jnz") return lhs + " == " + rhs;
+    if (mnemonic == "jg" || mnemonic == "ja") return lhs + " <= " + rhs;
+    if (mnemonic == "jge" || mnemonic == "jae") return lhs + " < " + rhs;
+    if (mnemonic == "jl" || mnemonic == "jb") return lhs + " >= " + rhs;
+    if (mnemonic == "jle" || mnemonic == "jbe") return lhs + " > " + rhs;
+    return "true";
+}
+
+unsigned long addressNumber(const std::string& address) {
+    try {
+        return std::stoul(address, nullptr, 16);
+    } catch (...) {
+        return 0;
+    }
 }
 
 }  // namespace
@@ -139,25 +204,135 @@ std::string ElfAnalyzer::pseudocode(const Function& function) const {
     std::ostringstream output;
     output << "// Rekonstruksi heuristik - ELF x86-64 System V AMD64 ABI\n";
     output << "// Address: 0x" << std::hex << function.address << ", size: " << std::dec << function.size << " bytes\n";
-    output << "long " << safeCppName(function.name) << "() {\n";
+    output << "long " << safeCppName(function.name) << "(long arg1, long arg2, long arg3, long arg4) {\n";
+    output << "    long result = 0;\n";
+
+    std::unordered_map<std::string, std::string> value = {
+        {"rdi", "arg1"}, {"rsi", "arg2"}, {"rdx", "arg3"}, {"rcx", "arg4"},
+        {"r8", "arg5"}, {"r9", "arg6"}, {"rax", "result"},
+    };
+    std::string comparedLeft;
+    std::string comparedRight;
+    const auto expressionFor = [&value](const std::string& operand) {
+        const std::string local = stackVariable(operand);
+        if (!local.empty()) return local;
+        const std::string registerName = canonicalRegister(operand);
+        const auto found = value.find(registerName);
+        return found == value.end() ? operand : found->second;
+    };
+
+    // A conditional branch to an earlier address is the x86-64 signature of a loop.
+    // Keep its bounds so the linear disassembly can be emitted as a do/while block.
+    std::map<std::size_t, std::size_t> loopEndForStart;
+    std::map<std::size_t, std::size_t> loopStartForEnd;
+    std::map<std::size_t, std::size_t> guardedLoopEnd;
+    std::string loopCounterRegister;
+    for (std::size_t index = 0; index < function.instructions.size(); ++index) {
+        const Instruction& instruction = function.instructions[index];
+        const auto opcodeEnd = instruction.text.find_first_of(" \t");
+        const std::string opcode = opcodeEnd == std::string::npos ? instruction.text : instruction.text.substr(0, opcodeEnd);
+        if (opcode.empty() || opcode[0] != 'j' || opcode == "jmp") continue;
+
+        const unsigned long target = addressNumber(branchTarget(instruction.text));
+        const unsigned long current = addressNumber(instruction.address);
+        if (target >= current || target == 0) continue;
+        for (std::size_t start = 0; start < index; ++start) {
+            if (addressNumber(function.instructions[start].address) != target) continue;
+            loopEndForStart[start] = index;
+            loopStartForEnd[index] = start;
+            if (index > 0 && startsWith(function.instructions[index - 1].text, "cmp")) {
+                const std::vector<std::string> comparison = operands(function.instructions[index - 1].text);
+                if (!comparison.empty()) loopCounterRegister = canonicalRegister(comparison[0]);
+            }
+            for (std::size_t guard = 0; guard < start; ++guard) {
+                const auto guardEnd = function.instructions[guard].text.find_first_of(" \t");
+                const std::string guardOpcode = guardEnd == std::string::npos ? function.instructions[guard].text
+                                                                               : function.instructions[guard].text.substr(0, guardEnd);
+                const unsigned long guardTarget = addressNumber(branchTarget(function.instructions[guard].text));
+                if (!guardOpcode.empty() && guardOpcode[0] == 'j' && guardOpcode != "jmp" && guardTarget > current) {
+                    guardedLoopEnd[guard] = index;
+                }
+            }
+            break;
+        }
+    }
+
     bool hasReturn = false;
-    for (const Instruction& instruction : function.instructions) {
+    for (std::size_t index = 0; index < function.instructions.size(); ++index) {
+        const Instruction& instruction = function.instructions[index];
         const std::string& text = instruction.text;
+        const auto opcodeEnd = text.find_first_of(" \t");
+        const std::string opcode = opcodeEnd == std::string::npos ? text : text.substr(0, opcodeEnd);
+        const std::vector<std::string> args = operands(text);
+
+        if (loopEndForStart.count(index) != 0) output << "    do {\n";
+
+        if ((opcode == "mov" || opcode == "movzx" || opcode == "movsxd") && args.size() == 2) {
+            const std::string destination = stackVariable(args[0]);
+            const std::string source = expressionFor(args[1]);
+            if (!destination.empty()) {
+                output << "    long " << destination << " = " << source << ";\n";
+            } else {
+                const std::string destinationRegister = canonicalRegister(args[0]);
+                if (destinationRegister == loopCounterRegister) {
+                    output << "    long i = " << source << ";\n";
+                    value[destinationRegister] = "i";
+                } else {
+                    value[destinationRegister] = source;
+                }
+            }
+            continue;
+        }
+        if (opcode == "lea" && args.size() == 2) {
+            value[canonicalRegister(args[0])] = "&" + args[1];
+            continue;
+        }
+        if ((opcode == "add" || opcode == "sub" || opcode == "imul") && args.size() == 2) {
+            const std::string destination = canonicalRegister(args[0]);
+            const std::string operatorText = opcode == "add" ? " + " : opcode == "sub" ? " - " : " * ";
+            const std::string currentValue = expressionFor(args[0]);
+            const std::string rightValue = expressionFor(args[1]);
+            if (!loopCounterRegister.empty() && destination == loopCounterRegister) {
+                output << "    i " << (opcode == "add" ? "+=" : opcode == "sub" ? "-=" : "*=") << " " << rightValue << ";\n";
+                value[destination] = "i";
+            } else if (loopEndForStart.size() > 0 && value.count(destination) != 0) {
+                output << "    " << currentValue << " " << (opcode == "add" ? "+=" : opcode == "sub" ? "-=" : "*=")
+                       << " " << rightValue << ";\n";
+                value[destination] = currentValue;
+            } else {
+                value[destination] = "(" + currentValue + operatorText + rightValue + ")";
+            }
+            continue;
+        }
+        if (opcode == "xor" && args.size() == 2 && canonicalRegister(args[0]) == canonicalRegister(args[1])) {
+            value[canonicalRegister(args[0])] = "0";
+            continue;
+        }
+        if ((opcode == "cmp" || opcode == "test") && args.size() == 2) {
+            comparedLeft = expressionFor(args[0]);
+            comparedRight = opcode == "test" && args[0] == args[1] ? "0" : expressionFor(args[1]);
+            continue;
+        }
         if (startsWith(text, "call")) {
             const std::string callee = callTarget(text);
-            output << "    " << (callee.empty() ? "/* indirect call */" : safeCppName(callee) + "()") << ";\n";
-        } else if (startsWith(text, "je ") || startsWith(text, "jz ")) {
-            output << "    if (condition == 0) goto label_" << branchTarget(text) << ";\n";
-        } else if (startsWith(text, "jne ") || startsWith(text, "jnz ")) {
-            output << "    if (condition != 0) goto label_" << branchTarget(text) << ";\n";
-        } else if (startsWith(text, "jg ") || startsWith(text, "ja ")) {
-            output << "    if (condition > 0) goto label_" << branchTarget(text) << ";\n";
-        } else if (startsWith(text, "jl ") || startsWith(text, "jb ")) {
-            output << "    if (condition < 0) goto label_" << branchTarget(text) << ";\n";
-        } else if (startsWith(text, "jmp ")) {
-            output << "    goto label_" << branchTarget(text) << ";\n";
+            const std::string call = callee.empty() ? "/* indirect_call */" : safeCppName(callee);
+            output << "    " << call << "(" << expressionFor("rdi") << ", " << expressionFor("rsi") << ");\n";
+            value["rax"] = "result";
+        } else if (guardedLoopEnd.count(index) != 0) {
+            output << "    if (" << invertedConditionFor(opcode, comparedLeft, comparedRight) << ") {\n";
+        } else if (loopStartForEnd.count(index) != 0) {
+            output << "    } while (" << conditionFor(opcode, comparedLeft, comparedRight) << ");\n";
+            for (const auto& guard : guardedLoopEnd) {
+                if (guard.second == index) output << "    }\n";
+            }
+        } else if (!opcode.empty() && opcode[0] == 'j' && opcode != "jmp") {
+            output << "    if (" << conditionFor(opcode, comparedLeft, comparedRight) << ") {\n";
+            output << "        // branch to 0x" << branchTarget(text) << "\n";
+            output << "    }\n";
+        } else if (opcode == "jmp") {
+            output << "    // jump to 0x" << branchTarget(text) << "\n";
         } else if (text == "ret" || text == "retq") {
-            output << "    return result;\n";
+            output << "    return " << expressionFor("rax") << ";\n";
             hasReturn = true;
         }
     }
@@ -177,9 +352,14 @@ std::string ElfAnalyzer::safeCppName(std::string name) {
 
 std::string ElfAnalyzer::branchTarget(const std::string& instruction) {
     const auto begin = instruction.find("0x");
-    if (begin == std::string::npos) return "unknown";
-    const auto end = instruction.find_first_of(" <", begin);
-    return instruction.substr(begin + 2, end == std::string::npos ? std::string::npos : end - begin - 2);
+    if (begin != std::string::npos) {
+        const auto end = instruction.find_first_of(" <", begin);
+        return instruction.substr(begin + 2, end == std::string::npos ? std::string::npos : end - begin - 2);
+    }
+    const std::vector<std::string> target = operands(instruction);
+    if (target.empty()) return "unknown";
+    const auto end = target[0].find_first_of(" <");
+    return target[0].substr(0, end);
 }
 
 std::string ElfAnalyzer::callTarget(const std::string& instruction) {
